@@ -13,13 +13,34 @@
 #   * It runs on CPU or GPU and batches internally, which changes how this
 #     script should parallelise -- see the --workers note below.
 #
-# Defaults mirror MI_estimate_timed.py (n_inits=5, n_folds=3, n_bootstrap=100,
-# mc_samples=1e5, max_components=50, max_iter=10000) so the two scripts are
-# comparable. Two deliberate deviations, both flagged at runtime:
-#   * reg_covar defaults to 1e-6, not GMM-MI's 1e-15. The library documents
-#     that 1e-15 "would regularise nothing" and is unsafe at float32.
+# Statistical settings mirror MI_estimate_timed.py (n_inits=5, n_folds=3,
+# n_bootstrap=100, mc_samples=1e5, max_iter=10000) so the two scripts stay
+# comparable. The gmm-mi-torch-specific defaults are instead tuned for a GPU
+# HPC node, following the port's own recommended settings in
+# validation/gb10_report.md section 4:
+#
+#   * device='cuda', dtype=float32. fp32 is fully validated and 20-25x faster
+#     than fp64 on GB10, where CUDA fp64 is actually SLOWER than CPU fp64
+#     (38.6 s vs 11.5 s on the reference benchmark). On a datacentre card with
+#     1:2 fp64 (A100, H100) the gap is smaller, but fp32 still wins. Pass
+#     --dtype float64 for a reference-precision cross-check.
+#   * em_chunk and mc_chunk default to "auto", which means a single full batch:
+#     em_chunk = max_components * n_inits * n_folds and mc_chunk = n_bootstrap,
+#     exactly the report's rule. At chunk=8 the selection replicates serialise
+#     into many kernel launches; batching them all roughly halves GPU wall time.
+#   * max_components defaults to 20, not GMM-MI's 50. The batched protocol pays
+#     for every k unconditionally, and peak memory is driven by the un-chunked
+#     (R,N,K,d) init/M-step tensor with R = max_components*n_inits*n_folds and
+#     K = max_components -- so cost grows ~quadratically in max_components and
+#     is NOT reduced by em_chunk. 50 would mean 750 replicates at K=50.
+#   * reg_covar defaults to 1e-6, not GMM-MI's 1e-15, which the library
+#     documents as regularising nothing and being unsafe at float32.
 #   * init_type defaults to 'random_responsibilities'; GMM-MI's
-#     'random_sklearn' has no counterpart in the port.
+#     'random_sklearn' has no counterpart in the port. At very large N switch to
+#     'minmax', whose init avoids a large responsibility draw.
+#   * The (cat, lat) sweep runs SERIALLY on GPU. The library already batches
+#     internally; one CUDA context per worker just contends for the same card.
+#     Scale with --em_chunk/--mc_chunk, not --workers.
 import pandas as pd
 import numpy as np
 import matplotlib as mpl
@@ -106,16 +127,18 @@ parser.add_argument(
 parser.add_argument(
     "--device",
     type=str,
-    default="cpu",
+    default="cuda",
     help="Torch device to fit and integrate on, e.g. 'cpu' or 'cuda'",
 )
 parser.add_argument(
     "--dtype",
     type=str,
-    default="float64",
+    default="float32",
     choices=["float64", "float32"],
-    help="Working precision. float32 is much faster on GPUs with limited fp64 "
-    "throughput (e.g. GB10); float64 is the reference precision",
+    help="Working precision. Defaults to float32, which is validated and "
+    "20-25x faster than fp64 on a GPU with rate-limited fp64 throughput; on "
+    "such cards CUDA fp64 is slower than CPU fp64. Use float64 for a "
+    "reference-precision cross-check (and keep reg_covar >= 1e-6 at float32)",
 )
 parser.add_argument(
     "--protocol",
@@ -140,10 +163,13 @@ parser.add_argument(
 parser.add_argument(
     "--max_components",
     type=int,
-    default=50,
-    help="Largest number of GMM components considered. Mirrors GMM-MI's "
-    "default of 50, but note the batched protocol pays for every k, so "
-    "lowering this is the single biggest speed knob",
+    default=20,
+    help="Largest number of GMM components considered. Deliberately 20 rather "
+    "than GMM-MI's 50: the batched protocol pays for every k unconditionally, "
+    "and GPU peak memory is set by the un-chunked (R,N,K,d) init/M-step tensor "
+    "with R=max_components*n_inits*n_folds and K=max_components, so cost grows "
+    "~quadratically here and em_chunk does NOT reduce it. This is the single "
+    "biggest speed and memory knob",
 )
 parser.add_argument("--n_inits", type=int, default=5, help="Initialisations per fold")
 parser.add_argument("--n_folds", type=int, default=3, help="Cross-validation folds")
@@ -166,18 +192,27 @@ parser.add_argument(
 parser.add_argument(
     "--em_chunk",
     type=int,
-    default=8,
-    help="EM replicates per batch. Larger is faster on GPU at higher peak memory",
+    default=None,
+    help="EM replicates per batch. Default 'auto' = max_components*n_inits*"
+    "n_folds, i.e. the full replicate count so selection EM runs as ONE batch, "
+    "per the port's recommended GPU settings. The library's own default of 8 "
+    "serialises selection into many kernel launches and roughly doubles GPU "
+    "wall time",
 )
 parser.add_argument(
-    "--mc_chunk", type=int, default=8, help="Bootstrap replicates per MC integration batch"
+    "--mc_chunk",
+    type=int,
+    default=None,
+    help="Bootstrap replicates per MC integration batch. Default 'auto' = "
+    "n_bootstrap, so the whole bootstrap integrates as one batch",
 )
 parser.add_argument(
     "--n_chunk",
     type=int,
     default=None,
     help="If set, stream EM over the sample dimension in chunks of this size to "
-    "bound peak memory at large N",
+    "bound peak memory at large N. Only needed well beyond N~1e6 (the port "
+    "tuned n_chunk=2.5e5 at N=1e7); leave unset at typical latent-space sizes",
 )
 parser.add_argument(
     "--workers",
@@ -193,6 +228,28 @@ args = parser.parse_args()
 
 TORCH_DTYPE = {"float64": torch.float64, "float32": torch.float32}[args.dtype]
 
+# Fail loudly rather than silently falling back to CPU: on a GPU node an
+# unavailable CUDA device almost always means a bad job script (no --gres, wrong
+# module, login node), and a silent CPU run at fp32 would just be slow and
+# confusing.
+if args.device.startswith("cuda") and not torch.cuda.is_available():
+    raise SystemExit(
+        f"device={args.device} requested but torch.cuda.is_available() is False. "
+        "Check the job has a GPU allocated and that the CUDA-enabled torch build "
+        "is loaded, or pass --device cpu explicitly."
+    )
+
+# em_chunk/mc_chunk default to a single full batch, which is the port's
+# recommended GPU configuration (validation/gb10_report.md section 4:
+# "set em_chunk to the full replicate count so EM runs as a single batch").
+# Deriving them means they stay correct if max_components/n_inits/n_folds change.
+EM_CHUNK = (
+    args.em_chunk
+    if args.em_chunk is not None
+    else max(1, args.max_components * args.n_inits * args.n_folds)
+)
+MC_CHUNK = args.mc_chunk if args.mc_chunk is not None else max(1, args.n_bootstrap)
+
 # Hyperparameters passed to every estimate() call. Assembled once so the timing
 # summary can report exactly what was run.
 ESTIMATE_KWARGS = dict(
@@ -207,8 +264,8 @@ ESTIMATE_KWARGS = dict(
     max_iter=args.max_iter,
     device=args.device,
     dtype=TORCH_DTYPE,
-    em_chunk=args.em_chunk,
-    mc_chunk=args.mc_chunk,
+    em_chunk=EM_CHUNK,
+    mc_chunk=MC_CHUNK,
     init_type=args.init_type,
     preprocess=args.preprocess,
     n_chunk=args.n_chunk,
@@ -264,17 +321,35 @@ print(
     "preprocess:",
     args.preprocess,
     "em_chunk:",
-    args.em_chunk,
+    EM_CHUNK,
+    "(auto)" if args.em_chunk is None else "(explicit)",
     "mc_chunk:",
-    args.mc_chunk,
+    MC_CHUNK,
+    "(auto)" if args.mc_chunk is None else "(explicit)",
     "n_chunk:",
     args.n_chunk,
 )
+if args.device.startswith("cuda"):
+    # Worth recording: fp64 throughput differs by an order of magnitude between
+    # cards, so timings are only comparable against a named GPU.
+    _props = torch.cuda.get_device_properties(torch.cuda.current_device())
+    print(
+        f"GPU: {_props.name}, {_props.total_memory / 1024 ** 3:.1f} GiB, "
+        f"capability {_props.major}.{_props.minor}, torch {torch.__version__}"
+    )
 if args.dtype == "float32" and args.reg_covar < 1e-8:
     print(
         f"WARNING: reg_covar={args.reg_covar:g} is below float32 resolution and "
         "will regularise nothing; Cholesky factorisations may fail. Use >=1e-6 "
         "at float32."
+    )
+if args.protocol == "batched" and args.max_components > 30:
+    print(
+        f"WARNING: max_components={args.max_components} with protocol='batched' "
+        f"fits {args.max_components * args.n_inits * args.n_folds} replicates at "
+        f"K={args.max_components}. Peak memory scales ~quadratically here and is "
+        "not reduced by em_chunk; lower max_components or use "
+        "--protocol sequential if you hit OOM."
     )
 file_param = args.file_param
 data_dir = "/rds/user/bv322/hpc-work/vae/"
@@ -506,6 +581,8 @@ if __name__ == "__main__":
     ]
     timings = []  # (cat_id, lat_id, seconds) for pairs that actually ran
 
+    if args.device.startswith("cuda"):
+        torch.cuda.reset_peak_memory_stats()
     t_start = time.perf_counter()
     if n_workers == 1:
         results = [estimate_mi(cat_id, lat_id) for cat_id, lat_id in pairs]
@@ -538,7 +615,20 @@ if __name__ == "__main__":
         f"protocol / max_comp    : {args.protocol} / {args.max_components}"
     )
     print(f"n_bootstrap / mc       : {args.n_bootstrap} / {args.mc_samples}")
+    print(
+        f"em_chunk / mc_chunk    : {EM_CHUNK} / {MC_CHUNK}"
+        f"{' (auto, full batch)' if args.em_chunk is None else ''}"
+    )
     print(f"worker processes       : {n_workers}")
+    if args.device.startswith("cuda"):
+        # Headroom against total_memory tells you whether em_chunk/mc_chunk can
+        # go higher, or whether max_components has to come down.
+        print(
+            f"peak GPU memory        : "
+            f"{torch.cuda.max_memory_allocated() / 1024 ** 3:.2f} GiB "
+            f"allocated, {torch.cuda.max_memory_reserved() / 1024 ** 3:.2f} GiB "
+            f"reserved"
+        )
     print(f"total wall-clock       : {total_wall:.1f} s")
     if timings:
         seconds = np.array([t[2] for t in timings])
